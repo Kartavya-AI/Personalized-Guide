@@ -4,7 +4,6 @@ gunicorn
 langchain-google-genai
 langchain-core
 pandas
-sqlite3
 python-dotenv
 pydantic
 httpx
