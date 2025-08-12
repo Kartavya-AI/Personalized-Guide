@@ -4,9 +4,8 @@ import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 import uvicorn
 from dotenv import load_dotenv
@@ -20,8 +19,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-security = HTTPBearer(auto_error=False)
 
 class CityRequest(BaseModel):
     city: str = Field(..., min_length=1, max_length=100, description="City name to get travel guide for")
@@ -61,14 +58,26 @@ class HealthResponse(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.now)
     version: str = "1.0.0"
 
+# Get Gemini API key from environment variables
+def get_gemini_api_key() -> str:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        logger.error("GEMINI_API_KEY environment variable is not set")
+        raise ValueError("Gemini API key is not configured")
+    return api_key
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up Personalized AI Guide API")
     try:
+        # Validate Gemini API key on startup
+        api_key = get_gemini_api_key()
+        logger.info("Gemini API key loaded successfully")
+        
         init_db()
         logger.info("Database initialized successfully")
     except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
+        logger.error(f"Failed to initialize application: {e}")
         raise
     
     yield
@@ -91,27 +100,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def get_api_key(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    if not credentials:
-        if os.getenv("REQUIRE_AUTH", "false").lower() == "true":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="API key required"
-            )
-        return os.getenv("DEFAULT_GEMINI_API_KEY", "")
-    
-    api_key = credentials.credentials
-    if not api_key or len(api_key) < 10:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key format"
-        )
-    
-    return api_key
-
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    return HealthResponse(status="healthy")
+    try:
+        # Also check if API key is available
+        get_gemini_api_key()
+        return HealthResponse(status="healthy")
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service unhealthy: Gemini API key not configured"
+        )
 
 @app.get("/", response_model=dict)
 async def root():
@@ -123,24 +123,22 @@ async def root():
     }
 
 @app.post("/guide", response_model=GuideResponse)
-async def get_travel_guide(
-    request: CityRequest,
-    api_key: str = Depends(get_api_key)
-):
+async def get_travel_guide(request: CityRequest):
     try:
         logger.info(f"Generating guide for city: {request.city}")
         
-        if not api_key:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Gemini API key is required"
-            )
-        
+        api_key = get_gemini_api_key()
         guide_content = get_guide_response(api_key, request.city)
         
         logger.info(f"Successfully generated guide for {request.city}")
         return GuideResponse(guide_content=guide_content)
         
+    except ValueError as ve:
+        logger.error(f"Configuration error: {str(ve)}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service configuration error: Gemini API key not available"
+        )
     except Exception as e:
         logger.error(f"Error generating guide for {request.city}: {str(e)}")
         raise HTTPException(
@@ -149,18 +147,9 @@ async def get_travel_guide(
         )
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat_with_guide(
-    request: ChatRequest,
-    api_key: str = Depends(get_api_key)
-):
+async def chat_with_guide(request: ChatRequest):
     try:
         logger.info("Processing chat request")
-        
-        if not api_key:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Gemini API key is required"
-            )
         
         messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
         last_user_message = next(
@@ -174,11 +163,18 @@ async def chat_with_guide(
             place_to_save = save_match.group(1).strip()
             response_text = add_favorite(request.city_context, place_to_save)
         else:
+            api_key = get_gemini_api_key()
             response_text = get_chat_response(api_key, messages)
         
         logger.info("Chat request processed successfully")
         return ChatResponse(response=response_text)
         
+    except ValueError as ve:
+        logger.error(f"Configuration error: {str(ve)}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service configuration error: Gemini API key not available"
+        )
     except Exception as e:
         logger.error(f"Error processing chat request: {str(e)}")
         raise HTTPException(
